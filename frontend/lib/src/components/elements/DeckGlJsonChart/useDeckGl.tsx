@@ -17,53 +17,53 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 
 import JSON5 from "json5"
-import {
-  CartoLayer,
-  colorBins,
-  colorCategories,
-  colorContinuous,
-} from "@deck.gl/carto/typed"
-import * as layers from "@deck.gl/layers/typed"
-import { JSONConverter } from "@deck.gl/json/typed"
-import * as geoLayers from "@deck.gl/geo-layers/typed"
-import * as aggregationLayers from "@deck.gl/aggregation-layers/typed"
-import * as meshLayers from "@deck.gl/mesh-layers/typed"
 import { PickingInfo } from "@deck.gl/core/typed"
 import isEqual from "lodash/isEqual"
 import { ViewStateChangeParameters } from "@deck.gl/core/typed/controllers/controller"
 import { TooltipContent } from "@deck.gl/core/typed/lib/tooltip"
+import queryString from "query-string"
 
-import type { DeckObject, PropsWithHeight, StreamlitDeckProps } from "./types"
+import { EmotionTheme } from "@streamlit/lib/src/theme"
+import { assertNever } from "@streamlit/lib/src/util/assertNever"
+import { hexToRgba } from "@streamlit/lib/src/util/hexToRgba"
 
-export type UseDeckGlShape = {
+import type {
+  DeckObject,
+  LayerSelection,
+  ParsedDeckGlConfig,
+  PropsWithHeight,
+} from "./types"
+import { jsonConverter } from "./utils/jsonConverter"
+import {
+  FillFunction,
+  getContextualFillColor,
+  LAYER_TYPE_TO_FILL_FUNCTION,
+  type LayerSelectionColorMode,
+} from "./utils/colors"
+
+type UseDeckGlShape = {
   createTooltip: (info: PickingInfo | null) => TooltipContent
   deck: DeckObject
   onViewStateChange: (params: ViewStateChangeParameters) => void
+  setSelection: React.Dispatch<
+    React.SetStateAction<Record<string, LayerSelection>>
+  >
   viewState: Record<string, unknown>
 }
 
-export type UseDeckGlProps = Omit<PropsWithHeight, "theme" | "mapboxToken"> & {
+type VisualLayerSelectionMode = "perLayer" | "perMap"
+
+export type UseDeckGlProps = Omit<
+  PropsWithHeight,
+  "mapboxToken" | "fragmentId"
+> & {
   isLightTheme: boolean
+  layerSelectionColorMode?: LayerSelectionColorMode
+  theme: EmotionTheme
+  visualLayerSelectionMode?: VisualLayerSelectionMode
 }
 
 const DEFAULT_DECK_GL_HEIGHT = 500
-
-const configuration = {
-  classes: {
-    ...layers,
-    ...aggregationLayers,
-    ...geoLayers,
-    ...meshLayers,
-    CartoLayer,
-  },
-  functions: {
-    colorBins,
-    colorCategories,
-    colorContinuous,
-  },
-}
-
-export const jsonConverter = new JSONConverter({ configuration })
 
 /**
  * Interpolates variables within a string using values from a PickingInfo object.
@@ -96,9 +96,51 @@ const interpolate = (info: PickingInfo, body: string): string => {
   return body
 }
 
+const getShouldUseOriginalFillFunction = (
+  selectedIndices: number[],
+  anyLayersHaveSelection: boolean,
+  visualLayerSelectionMode: VisualLayerSelectionMode
+): boolean => {
+  switch (visualLayerSelectionMode) {
+    case "perLayer":
+      return selectedIndices.length === 0
+    case "perMap":
+      return !anyLayersHaveSelection
+    default:
+      assertNever(visualLayerSelectionMode)
+      return false
+  }
+}
+
 export const useDeckGl = (props: UseDeckGlProps): UseDeckGlShape => {
-  const { element, height, isLightTheme, width } = props
+  const { element, height, isLightTheme, theme, widgetMgr, width } = props
   const { tooltip, useContainerWidth: shouldUseContainerWidth } = element
+
+  //#region QueryString Parsing
+  // TODO: Remove this region. This is only here for easy testing while we iterate on our options.
+  const parsedQueryString = queryString.parse(window.location.search)
+  const layerSelectionColorMode = (parsedQueryString.layerSelectionColorMode ||
+    props.layerSelectionColorMode ||
+    "opacity") as LayerSelectionColorMode
+  const visualLayerSelectionMode =
+    (parsedQueryString.visualLayerSelectionMode ||
+      props.visualLayerSelectionMode ||
+      "perMap") as VisualLayerSelectionMode
+  const unselectedOpacity = parsedQueryString.unselectedOpacity
+    ? parseInt(parsedQueryString.unselectedOpacity as string)
+    : undefined
+  //#endregion
+
+  const [selection, setSelection] = useState<Record<string, LayerSelection>>(
+    () => {
+      const initialFigureState = widgetMgr.getElementState(
+        element.id,
+        "selection"
+      )
+
+      return initialFigureState ?? {}
+    }
+  )
 
   const [viewState, setViewState] = useState<Record<string, unknown>>({
     bearing: 0,
@@ -113,7 +155,7 @@ export const useDeckGl = (props: UseDeckGlProps): UseDeckGlShape => {
   const isFullScreen = props.isFullScreen ?? false
 
   const parsedPydeckJson = useMemo(() => {
-    return Object.freeze(JSON5.parse<StreamlitDeckProps>(element.json))
+    return Object.freeze(JSON5.parse<ParsedDeckGlConfig>(element.json))
     // Only parse JSON when transitioning to/from fullscreen, the json changes, or theme changes
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isFullScreen, isLightTheme, element.json])
@@ -141,6 +183,77 @@ export const useDeckGl = (props: UseDeckGlProps): UseDeckGlShape => {
       }
     }
 
+    if (
+      copy.layers &&
+      // If the layerSelectionColorMode is original, Streamlit does not change
+      // any colors of the objects in layers
+      layerSelectionColorMode !== "original"
+    ) {
+      const anyLayersHaveSelection = Object.values(selection).some(
+        ({ indices }) => indices?.length
+      )
+
+      copy.layers = copy.layers.map(layer => {
+        if (!layer || Array.isArray(layer)) {
+          return layer
+        }
+
+        const layerId = `${layer.id || null}`
+        const selectedIndices = selection[layerId]?.indices || []
+
+        const fillFunction = LAYER_TYPE_TO_FILL_FUNCTION[layer["@@type"]]
+
+        if (!fillFunction || !Object.hasOwn(layer, fillFunction)) {
+          return layer
+        }
+
+        const clonedLayer = { ...layer }
+        clonedLayer.updateTriggers = {
+          // Tell Deck.gl to recompute the fill color when the selection changes.
+          // Without this, objects in layers will have stale colors when selection changes.
+          // @see https://deck.gl/docs/api-reference/core/layer#updatetriggers
+          [fillFunction]: [
+            ...(clonedLayer.updateTriggers?.[fillFunction] || []),
+            selectedIndices,
+            anyLayersHaveSelection,
+          ],
+        }
+
+        const shouldUseOriginalFillFunction = getShouldUseOriginalFillFunction(
+          selectedIndices,
+          anyLayersHaveSelection,
+          visualLayerSelectionMode
+        )
+
+        if (shouldUseOriginalFillFunction) {
+          // If we aren't changing the fill color, we don't need to change the fillFunction
+          return clonedLayer
+        }
+
+        const originalFillFunction = layer[fillFunction] as FillFunction
+
+        const selectedColor = hexToRgba(theme.colors.primary)
+        const unselectedColor = hexToRgba(theme.colors.gray20)
+
+        const newFillFunction: FillFunction = (object, objectInfo) => {
+          return getContextualFillColor({
+            isSelected: selectedIndices.includes(objectInfo.index),
+            layerSelectionColorMode,
+            object,
+            objectInfo,
+            originalFillFunction,
+            selectedColor,
+            unselectedColor,
+            unselectedOpacity,
+          })
+        }
+
+        clonedLayer[fillFunction] = newFillFunction
+
+        return clonedLayer
+      })
+    }
+
     delete copy?.views // We are not using views. This avoids a console warning.
 
     return jsonConverter.convert(copy)
@@ -148,8 +261,14 @@ export const useDeckGl = (props: UseDeckGlProps): UseDeckGlShape => {
     height,
     isFullScreen,
     isLightTheme,
+    layerSelectionColorMode,
     parsedPydeckJson,
+    selection,
     shouldUseContainerWidth,
+    theme.colors.gray20,
+    theme.colors.primary,
+    unselectedOpacity,
+    visualLayerSelectionMode,
     width,
   ])
 
@@ -207,6 +326,7 @@ export const useDeckGl = (props: UseDeckGlProps): UseDeckGlShape => {
     createTooltip,
     deck,
     onViewStateChange,
+    setSelection,
     viewState,
   }
 }

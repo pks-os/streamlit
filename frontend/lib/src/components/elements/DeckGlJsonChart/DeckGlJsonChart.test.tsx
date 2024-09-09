@@ -23,6 +23,8 @@ import { PickingInfo } from "@deck.gl/core/typed"
 
 import { render } from "@streamlit/lib/src/test_util"
 import { DeckGlJsonChart as DeckGlJsonChartProto } from "@streamlit/lib/src/proto"
+import { WidgetStateManager } from "@streamlit/lib/src/WidgetStateManager"
+import { mockTheme } from "@streamlit/lib/src/mocks/mockTheme"
 import "@testing-library/jest-dom"
 
 import { DeckGlJsonChart } from "./DeckGlJsonChart"
@@ -82,6 +84,11 @@ const getProps = (
     mapboxToken: "mapboxToken",
     height: undefined,
     isFullScreen: false,
+    widgetMgr: new WidgetStateManager({
+      sendRerunBackMsg: jest.fn(),
+      formsDataChanged: jest.fn(),
+    }),
+    fragmentId: "myFragmentId",
   }
 }
 
@@ -92,6 +99,7 @@ const getUseDeckGlProps = (
   return {
     ...getProps(elementProps, initialViewStateProps),
     isLightTheme: false,
+    theme: mockTheme.emotion,
   }
 }
 

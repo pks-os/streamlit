@@ -15,16 +15,36 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, Final, Mapping, cast
+from dataclasses import dataclass
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Final,
+    Literal,
+    Mapping,
+    TypedDict,
+    cast,
+    overload,
+)
 
 from streamlit import config
+from streamlit.elements.lib.event_utils import AttributeDictionary
+from streamlit.elements.lib.utils import Key, compute_and_register_element_id, to_key
+from streamlit.errors import StreamlitAPIException
 from streamlit.proto.DeckGlJsonChart_pb2 import DeckGlJsonChart as PydeckProto
 from streamlit.runtime.metrics_util import gather_metrics
+from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
+from streamlit.runtime.state import (
+    WidgetCallback,
+    register_widget,
+)
 
 if TYPE_CHECKING:
     from pydeck import Deck
 
     from streamlit.delta_generator import DeltaGenerator
+    from streamlit.runtime.state import WidgetCallback
 
 
 # Mapping used when no data is passed.
@@ -33,13 +53,134 @@ EMPTY_MAP: Final[Mapping[str, Any]] = {
 }
 
 
+class PydeckSelectionState(TypedDict, total=False):
+    """
+    The schema for the PyDeck Chart Selection State
+
+    Attributes
+    ----------
+    color : (tuple[int, int, int, int] | None)
+        Color of the clicked object in RGBA format.
+    layer : (str | None)
+        The layer ID, which you can specify by passing `id=...` to a Layer;
+        `None` if no layer is picked.
+    index : (int)
+        The serial index of the clicked point in the data set; -1 if no layer is
+        picked.
+    picked : (bool)
+        Indicates whether an object was picked.
+    x : (float)
+        X coordinate of the pixel on click.
+    y : (float)
+        Y coordinate of the pixel on click.
+    pixel : (tuple[float, float])
+        Pixel coordinate pair.
+    coordinate : (tuple[float, float])
+        Latitude/longitude coordinate pair.
+    devicePixel : (tuple[int, int] | None)
+        Pixel coordinate pair on the device screen.
+    pixelRatio : (int)
+        The ratio of the resolution in physical pixels to the resolution in CSS
+        pixels for the current display device.
+    object : (dict[str, Any] | None)
+        Metadata from the selected clicked object, which varies by layer.
+    """
+
+    color: tuple[int, int, int, int] | None
+    layer: str | None
+    index: int
+    picked: bool
+    x: float
+    y: float
+    pixel: tuple[float, float]
+    coordinate: tuple[float, float]
+    devicePixel: tuple[int, int] | None
+    pixelRatio: int
+    object: dict[str, Any] | None
+
+
+class LayerSelectionState(TypedDict, total=False):
+    """
+    The schema for the PyDeck Layer Selection State
+
+    Attributes
+    ----------
+    last_selection : PydeckSelectionState
+        The last selection state.
+    indices : list[int]
+        List of indices of selected objects.
+    objects : list[dict[str, Any]]
+        List of metadata objects for the selected items.
+    """
+
+    last_selection: PydeckSelectionState
+    indices: list[int]
+    objects: list[dict[str, Any]]
+
+
+class PydeckState(TypedDict, total=False):
+    """
+    The schema for the PyDeck State
+
+    Attributes
+    ----------
+    selection : dict[str, LayerSelectionState] | None
+        A dictionary mapping layer IDs to their selection states; `None` if no
+        selection is made.
+    """
+
+    selection: dict[str, LayerSelectionState] | None
+
+
+@dataclass
+class PydeckSelectionSerde:
+    """PydeckSelectionSerde is used to serialize and deserialize the Pydeck selection state."""
+
+    def deserialize(self, ui_value: str | None, widget_id: str = "") -> PydeckState:
+        empty_selection_state: PydeckState = {"selection": None}
+
+        selection_state = (
+            empty_selection_state
+            if ui_value is None
+            else cast(PydeckState, AttributeDictionary(json.loads(ui_value)))
+        )
+
+        return selection_state
+
+    def serialize(self, selection_state: PydeckState) -> str:
+        return json.dumps(selection_state, default=str)
+
+
 class PydeckMixin:
+    @overload
+    def pydeck_chart(
+        self,
+        pydeck_obj: Deck | None = None,
+        use_container_width: bool = False,
+        *,
+        on_select: Literal["ignore"],  # No default value here to make it work with mypy
+        key: Key | None = None,
+    ) -> DeltaGenerator: ...
+
+    @overload
+    def pydeck_chart(
+        self,
+        pydeck_obj: Deck | None = None,
+        use_container_width: bool = False,
+        *,
+        on_select: Literal["rerun"] | WidgetCallback = "rerun",
+        key: Key | None = None,
+    ) -> PydeckState: ...
+
     @gather_metrics("pydeck_chart")
     def pydeck_chart(
         self,
         pydeck_obj: Deck | None = None,
         use_container_width: bool = False,
-    ) -> DeltaGenerator:
+        *,
+        on_select: Literal["rerun", "ignore"] | WidgetCallback = "ignore",
+        key: Key | None = None,
+    ) -> DeltaGenerator | PydeckState:
         """Draw a chart using the PyDeck library.
 
         This supports 3D maps, point clouds, and more! More info about PyDeck
@@ -134,7 +275,48 @@ class PydeckMixin:
 
         """
         pydeck_proto = PydeckProto()
+        ctx = get_script_run_ctx()
         marshall(pydeck_proto, pydeck_obj, use_container_width)
+        key = to_key(key)
+        is_selection_activated = on_select != "ignore"
+
+        pydeck_proto.id = (
+            compute_and_register_element_id(
+                "deck_gl_json_chart",
+                user_key=key,
+                key=key,
+                is_selection_activated=is_selection_activated,
+                use_container_width=use_container_width,
+                page=ctx.active_script_hash if ctx else None,
+            )
+            if is_selection_activated
+            else ""
+        )
+
+        if on_select not in ["ignore", "rerun"] and not callable(on_select):
+            raise StreamlitAPIException(
+                f"You have passed {on_select} to `on_select`. But only 'ignore', 'rerun', or a callable is supported."
+            )
+
+        if is_selection_activated:
+            # Selections are activated, treat Pydeck as a widget:
+            pydeck_proto.has_selection = True
+
+            serde = PydeckSelectionSerde()
+
+            widget_state = register_widget(
+                "deck_gl_json_chart",
+                pydeck_proto,
+                ctx=ctx,
+                deserializer=serde.deserialize,
+                on_change_handler=on_select if callable(on_select) else None,
+                serializer=serde.serialize,
+            )
+
+            self.dg._enqueue("deck_gl_json_chart", pydeck_proto)
+
+            return cast(PydeckState, widget_state.value)
+
         return self.dg._enqueue("deck_gl_json_chart", pydeck_proto)
 
     @property

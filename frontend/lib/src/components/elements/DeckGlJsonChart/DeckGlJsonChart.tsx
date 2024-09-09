@@ -14,15 +14,16 @@
  * limitations under the License.
  */
 
-import React, { FC, useEffect, useState } from "react"
+import React, { FC, useCallback, useEffect, useState } from "react"
 
 import { DeckGL } from "@deck.gl/react/typed"
 import { MapContext, NavigationControl, StaticMap } from "react-map-gl"
 import { CSVLoader } from "@loaders.gl/csv"
 import { GLTFLoader } from "@loaders.gl/gltf"
 import { registerLoaders } from "@loaders.gl/core"
-import { LayersList } from "@deck.gl/core/typed"
+import { LayersList, PickingInfo } from "@deck.gl/core/typed"
 import { useTheme } from "@emotion/react"
+import JSON5 from "json5"
 
 import {
   EmotionTheme,
@@ -35,7 +36,11 @@ import {
   StyledDeckGlChart,
   StyledNavigationControlContainer,
 } from "./styled-components"
-import type { PropsWithHeight } from "./types"
+import type {
+  DeckGlElementState,
+  LayerSelection,
+  PropsWithHeight,
+} from "./types"
 import { useDeckGl } from "./useDeckGl"
 
 import "mapbox-gl/dist/mapbox-gl.css"
@@ -45,15 +50,27 @@ registerLoaders([CSVLoader, GLTFLoader])
 const EMPTY_LAYERS: LayersList = []
 
 export const DeckGlJsonChart: FC<PropsWithHeight> = props => {
-  const { element, height, isFullScreen, width } = props
-  const theme: EmotionTheme = useTheme()
-  const { createTooltip, deck, onViewStateChange, viewState } = useDeckGl({
+  const {
     element,
-    isLightTheme: hasLightBackgroundColor(theme),
-    width,
+    fragmentId,
     height,
     isFullScreen,
-  })
+    mapboxToken,
+    width,
+    widgetMgr,
+  } = props
+  const { hasSelection } = element
+  const theme: EmotionTheme = useTheme()
+  const { createTooltip, deck, onViewStateChange, setSelection, viewState } =
+    useDeckGl({
+      element,
+      height,
+      isFullScreen,
+      isLightTheme: hasLightBackgroundColor(theme),
+      theme,
+      widgetMgr,
+      width,
+    })
 
   const [isInitialized, setIsInitialized] = useState(false)
 
@@ -63,6 +80,92 @@ export const DeckGlJsonChart: FC<PropsWithHeight> = props => {
     // script got re-executed.
     setIsInitialized(true)
   }, [])
+
+  const handleClick = useCallback(
+    (
+      info: PickingInfo,
+      event: { srcEvent: MouseEvent | TouchEvent | PointerEvent }
+    ) => {
+      const {
+        color,
+        index,
+        picked,
+        x,
+        y,
+        pixel,
+        coordinate,
+        devicePixel,
+        pixelRatio,
+        object,
+      } = info
+
+      const layerId = `${info.layer?.id || null}`
+      const wasShiftClick = event.srcEvent.shiftKey
+
+      const stringValue = widgetMgr.getStringValue(element)
+      const currState: DeckGlElementState | null = stringValue
+        ? JSON5.parse(stringValue)
+        : null
+
+      const indices: number[] = wasShiftClick
+        ? currState?.selection[layerId]?.indices || []
+        : []
+
+      const objects: unknown[] = wasShiftClick
+        ? currState?.selection[layerId]?.objects || []
+        : []
+
+      const selection: LayerSelection = {
+        last_selection: {
+          color,
+          layer: layerId,
+          index,
+          picked,
+          x,
+          y,
+          pixel,
+          coordinate,
+          devicePixel,
+          pixelRatio,
+          object,
+        },
+        indices,
+        objects,
+      }
+
+      const existingIndex = indices.indexOf(index)
+
+      if (wasShiftClick && existingIndex !== -1) {
+        // Unselect an existing index
+        indices.splice(existingIndex, 1)
+        objects.splice(existingIndex, 1)
+      }
+
+      if (index !== -1) {
+        // Add the newly selected index
+        indices.push(index)
+        objects.push(object)
+      }
+
+      const newSelection: DeckGlElementState["selection"] = {
+        ...(wasShiftClick ? currState?.selection : {}),
+        [`${layerId}`]: { ...selection, indices },
+      }
+
+      setSelection(newSelection)
+
+      // Save the updated selection state to allow it to be recovered
+      widgetMgr.setElementState(element.id, "selection", newSelection)
+
+      widgetMgr.setStringValue(
+        element,
+        JSON.stringify({ selection: newSelection }),
+        { fromUi: true },
+        fragmentId
+      )
+    },
+    [element, fragmentId, setSelection, widgetMgr]
+  )
 
   return (
     <StyledDeckGlChart
@@ -81,6 +184,7 @@ export const DeckGlJsonChart: FC<PropsWithHeight> = props => {
         // @ts-expect-error There is a type mismatch due to our versions of the libraries
         ContextProvider={MapContext.Provider}
         controller
+        onClick={hasSelection ? handleClick : undefined}
       >
         <StaticMap
           height={deck.initialViewState.height}
@@ -91,7 +195,7 @@ export const DeckGlJsonChart: FC<PropsWithHeight> = props => {
               ? deck.mapStyle
               : deck.mapStyle[0])
           }
-          mapboxApiAccessToken={props.element.mapboxToken || props.mapboxToken}
+          mapboxApiAccessToken={element.mapboxToken || mapboxToken}
         />
         <StyledNavigationControlContainer>
           <NavigationControl
