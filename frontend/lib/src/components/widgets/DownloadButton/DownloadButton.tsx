@@ -16,6 +16,7 @@
 
 import React, { ReactElement } from "react"
 
+import createDownloadLinkElement from "@streamlit/lib/src/util/createDownloadLinkElement"
 import { DownloadButton as DownloadButtonProto } from "@streamlit/lib/src/proto"
 import BaseButton, {
   BaseButtonKind,
@@ -41,16 +42,11 @@ export function createDownloadLink(
   url: string,
   enforceDownloadInNewTab: boolean
 ): HTMLAnchorElement {
-  const link = document.createElement("a")
-  const uri = endpoints.buildMediaURL(url)
-  link.setAttribute("href", uri)
-  if (enforceDownloadInNewTab) {
-    link.setAttribute("target", "_blank")
-  } else {
-    link.setAttribute("target", "_self")
-  }
-  link.setAttribute("download", "")
-  return link
+  return createDownloadLinkElement({
+    enforceDownloadInNewTab,
+    url: endpoints.buildMediaURL(url),
+    filename: "",
+  })
 }
 
 function DownloadButton(props: Props): ReactElement {
@@ -60,10 +56,12 @@ function DownloadButton(props: Props): ReactElement {
     libConfig: { enforceDownloadInNewTab = false }, // Default to false, if no libConfig, e.g. for tests
   } = React.useContext(LibContext)
 
-  const kind =
-    element.type === "primary"
-      ? BaseButtonKind.PRIMARY
-      : BaseButtonKind.SECONDARY
+  let kind = BaseButtonKind.SECONDARY
+  if (element.type === "primary") {
+    kind = BaseButtonKind.PRIMARY
+  } else if (element.type === "tertiary") {
+    kind = BaseButtonKind.TERTIARY
+  }
 
   const handleDownloadClick: () => void = () => {
     // Downloads are only done on links, so create a hidden one and click it
